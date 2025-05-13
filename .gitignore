@@ -1,0 +1,8 @@
+cmake-build-debug
+Resources.tar
+.idea
+Atomic/
+Barrier/
+CMakeLists.txt
+Ex3.pdf
+MapReduceFrameworkKatzman.cpp
