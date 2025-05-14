@@ -9,6 +9,7 @@
 #include <vector>
 
 struct ThreadContext;
-void mapWorker(int threadID, ThreadContext* context);
+struct JobContext;
+void mapWorker(int threadID, ThreadContext* threadContext, JobContext* jobContext);
 
 #endif //EX3_MAPREDUCEFRAMEWORKHELPER_H
