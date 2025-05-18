@@ -8,7 +8,7 @@
 #include <atomic>
 #include <iostream>
 #include <algorithm>
-#include "Barrier.h"
+#include "Barrier/Barrier.h"
 // Bit masks
 constexpr uint64_t STAGE_MASK = 0x3ULL;
 constexpr uint64_t PROCESSED_MASK = 0x7FFFFFFFULL << 2;
@@ -30,21 +30,7 @@ uint32_t fetchNextInputIndex(std::atomic<uint64_t>* state) {
     return ((state->fetch_add(1ULL << 2) >> 2) & 0x7FFFFFFF);
 }
 
-void setStage(std::atomic<uint64_t> &state, stage_t newStage) {
-    uint64_t old = state.load();
-    while (true) {
-        uint64_t newVal = (old & ~STAGE_MASK) | ((uint64_t)newStage);
-        if (state.compare_exchange_weak(old, newVal)) break;
-    }
-}
 
-void setTotal(std::atomic<uint64_t> &state, uint32_t total) {
-    uint64_t old = state.load();
-    while (true) {
-        uint64_t newVal = (old & STAGE_MASK) | ((uint64_t)total << 33);
-        if (state.compare_exchange_weak(old, newVal)) break;
-    }
-}
 
 void getJobState(std::atomic<uint64_t> &state, JobState* out) {
     uint64_t snapshot = state.load();
@@ -70,6 +56,7 @@ struct JobContext {
     std::vector<std::thread> threads;
     std::vector<ThreadContext> contexts;
     Barrier barrier;
+    std::atomic<uint32_t>  workIndex;
     std::atomic<uint64_t> atomicInputIndex;
     std::vector<IntermediateVec> shuffleQueue;
     std::atomic<int> shuffleCounter;
@@ -81,16 +68,21 @@ struct JobContext {
                            OutputVec& outputVec,
                            int multiThreadLevel): client(client),
                            inputVec(inputVec), outputVec(outputVec),
-              multiThreadLevel(multiThreadLevel),
+              multiThreadLevel(multiThreadLevel), workIndex(0),
               barrier(multiThreadLevel), atomicInputIndex(0),
               shuffleCounter(0),
               threadsJoined(false)
     {
         threads.reserve(multiThreadLevel);
-        contexts.reserve(multiThreadLevel);
+        contexts.resize(multiThreadLevel);
     }
 };
-
+void setStageAndTotal(JobContext* jobContext, stage_t stage, uint32_t total)
+{
+    uint64_t newVal = packState(stage, 0, total);
+    jobContext->atomicInputIndex.store(newVal);
+    jobContext->workIndex.store(0);
+}
 K2* findMaxKey(JobContext* jobContext, const std::vector<size_t>& idx) {
     K2* maxKey = nullptr;
     for (int i = 0; i < jobContext->multiThreadLevel; ++i) {
@@ -138,12 +130,11 @@ void shuffle(JobContext* jobContext)
 
 void mapWorker(int threadID, ThreadContext* threadContext, JobContext* jobContext)
 {
-    setStage(jobContext->atomicInputIndex, MAP_STAGE);
-    setTotal(jobContext->atomicInputIndex, jobContext->inputVec.size());
     while (true)
     {
-        auto index = fetchNextInputIndex(threadContext->atomicInputIndex);
+        auto index = jobContext->workIndex.fetch_add(1);
         if (index >= jobContext->inputVec.size()) break;
+        fetchNextInputIndex(&jobContext->atomicInputIndex);
         const auto& pair = jobContext->inputVec[index];
         jobContext->client.map(pair.first, pair.second, threadContext);
     }
@@ -154,17 +145,19 @@ void mapWorker(int threadID, ThreadContext* threadContext, JobContext* jobContex
           });
     jobContext->barrier.barrier();
     if (threadID == 0) {
-        setStage(jobContext->atomicInputIndex,SHUFFLE_STAGE);
-        setTotal(jobContext->atomicInputIndex,jobContext->shuffleCounter);
+
+        setStageAndTotal(jobContext,SHUFFLE_STAGE,
+          jobContext->shuffleCounter);
         shuffle(jobContext);
+        setStageAndTotal(jobContext,REDUCE_STAGE,jobContext->shuffleQueue
+        .size());
     }
     jobContext->barrier.barrier();
-    setStage(jobContext->atomicInputIndex,REDUCE_STAGE);
-    setTotal(jobContext->atomicInputIndex,jobContext->shuffleQueue.size());
     while (true)
     {
-        auto index = fetchNextInputIndex(threadContext->atomicInputIndex);
+        auto index = jobContext->workIndex.fetch_add(1);
         if (index >= jobContext->shuffleQueue.size()) break;
+        fetchNextInputIndex(&jobContext->atomicInputIndex);
         IntermediateVec group = std::move(jobContext->shuffleQueue[index]);
         jobContext->client.reduce(&group,threadContext);
     }
@@ -186,6 +179,8 @@ JobHandle startMapReduceJob(const MapReduceClient& client,
         jobHandle->contexts[i].jobContext = jobHandle;
     }
     try {
+        setStageAndTotal(jobHandle, MAP_STAGE,
+                         jobHandle->inputVec.size());
         for (int i = 0; i < multiThreadLevel; ++i) {
             jobHandle->threads.emplace_back(mapWorker, i,
                                             &jobHandle->contexts[i],jobHandle);
@@ -195,6 +190,7 @@ JobHandle startMapReduceJob(const MapReduceClient& client,
         delete jobHandle;
         exit(1);
     }
+    return jobHandle;
 }
 void emit2(K2* key, V2* value, void* context) {
     auto* threadContext = static_cast<ThreadContext*>(context);
