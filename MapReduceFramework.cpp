@@ -8,31 +8,38 @@
 #include <atomic>
 #include <iostream>
 #include <algorithm>
-#include "Barrier/Barrier.h"
+#include "Barrier.h"
+#define THREAD_CREATION_ERROR "system error: failed to create thread"
+#define BAD_ALLOCATION_ERROR  "system error: memory allocation failed"
 // Bit masks
 constexpr uint64_t STAGE_MASK = 0x3ULL;
 constexpr uint64_t PROCESSED_MASK = 0x7FFFFFFFULL << 2;
 constexpr uint64_t TOTAL_MASK = 0x7FFFFFFFULL << 33;
 
-uint64_t packState(stage_t stage, uint32_t processed, uint32_t total) {
+//Structs and helper functions
+uint64_t packState(stage_t stage, uint32_t processed, uint32_t total)
+{
     return ((uint64_t)stage) |
            ((uint64_t)processed << 2) |
            ((uint64_t)total << 33);
 }
 
-void unpackState(uint64_t packed, stage_t &stage, uint32_t &processed, uint32_t &total) {
+void unpackState(uint64_t packed, stage_t &stage, uint32_t &processed, uint32_t &total)
+{
     stage = static_cast<stage_t>(packed & STAGE_MASK);
     processed = (packed >> 2) & 0x7FFFFFFF;
     total = (packed >> 33) & 0x7FFFFFFF;
 }
 
-uint32_t fetchNextInputIndex(std::atomic<uint64_t>* state) {
+uint32_t fetchNextInputIndex(std::atomic<uint64_t>* state)
+{
     return ((state->fetch_add(1ULL << 2) >> 2) & 0x7FFFFFFF);
 }
 
 
 
-void getJobState(std::atomic<uint64_t> &state, JobState* out) {
+void getJobState(std::atomic<uint64_t> &state, JobState* out)
+{
     uint64_t snapshot = state.load();
     stage_t stage;
     uint32_t processed, total;
@@ -41,37 +48,46 @@ void getJobState(std::atomic<uint64_t> &state, JobState* out) {
     out->percentage = (total == 0) ? 0 : (float)(100.0 * processed / total);
 }
 struct JobContext;
-struct ThreadContext {
-    int threadID;
+struct ThreadContext
+        {
+    int threadID{};
     std::atomic<uint64_t>* atomicInputIndex{};
     IntermediateVec intermediateVec;
-    JobContext* jobContext;
+    JobContext* jobContext{};
 
 };
-struct JobContext {
+struct JobContext
+        {
     const MapReduceClient& client;
-    const InputVec& inputVec;
-    OutputVec& outputVec;
-    int multiThreadLevel;
+    const InputVec&      inputVec;
+    OutputVec&           outputVec;
+    int                  multiThreadLevel;
     std::vector<std::thread> threads;
     std::vector<ThreadContext> contexts;
-    Barrier barrier;
-    std::atomic<uint32_t>  workIndex;
-    std::atomic<uint64_t> atomicInputIndex;
+    Barrier              barrier;
+    std::atomic<uint32_t>   workIndex;
+    std::atomic<uint64_t>   atomicInputIndex;
     std::vector<IntermediateVec> shuffleQueue;
-    std::atomic<int> shuffleCounter;
-    std::mutex outputMutex;
-    bool threadsJoined;
-    std::mutex joinThreadsMutex;
+    std::atomic<int>     shuffleCounter;
+    std::mutex           outputMutex;
+    bool                 threadsJoined;
+    std::mutex           joinThreadsMutex;
+
     JobContext(const MapReduceClient& client,
-                           const InputVec& inputVec,
-                           OutputVec& outputVec,
-                           int multiThreadLevel): client(client),
-                           inputVec(inputVec), outputVec(outputVec),
-              multiThreadLevel(multiThreadLevel), workIndex(0),
-              barrier(multiThreadLevel), atomicInputIndex(0),
-              shuffleCounter(0),
-              threadsJoined(false)
+               const InputVec& inputVec,
+               OutputVec& outputVec,
+               int multiThreadLevel)
+            : client(client)
+            , inputVec(inputVec)
+            , outputVec(outputVec)
+            , multiThreadLevel(multiThreadLevel)
+            , threads()
+            , contexts()
+            , barrier(multiThreadLevel)
+            , workIndex(0)
+            , atomicInputIndex(0)
+            , shuffleCounter(0)
+            , threadsJoined(false)
     {
         threads.reserve(multiThreadLevel);
         contexts.resize(multiThreadLevel);
@@ -83,7 +99,8 @@ void setStageAndTotal(JobContext* jobContext, stage_t stage, uint32_t total)
     jobContext->atomicInputIndex.store(newVal);
     jobContext->workIndex.store(0);
 }
-K2* findMaxKey(JobContext* jobContext, const std::vector<size_t>& idx) {
+K2* findMaxKey(JobContext* jobContext, const std::vector<size_t>& idx)
+{
     K2* maxKey = nullptr;
     for (int i = 0; i < jobContext->multiThreadLevel; ++i) {
         if (idx[i] == 0) continue;
@@ -147,7 +164,7 @@ void mapWorker(int threadID, ThreadContext* threadContext, JobContext* jobContex
     if (threadID == 0) {
 
         setStageAndTotal(jobContext,SHUFFLE_STAGE,
-          jobContext->shuffleCounter);
+          jobContext->shuffleCounter.load());
         shuffle(jobContext);
         setStageAndTotal(jobContext,REDUCE_STAGE,jobContext->shuffleQueue
         .size());
@@ -164,35 +181,53 @@ void mapWorker(int threadID, ThreadContext* threadContext, JobContext* jobContex
 
 }
 
-
+//API Functions
 
 JobHandle startMapReduceJob(const MapReduceClient& client,
                             const InputVec& inputVec, OutputVec& outputVec,
                             int multiThreadLevel)
 {
-    auto jobHandle = new JobContext{client,inputVec,outputVec,
-                                     multiThreadLevel};
+    JobContext* jobHandle = nullptr;
+    try
+    {
+        jobHandle = new JobContext{client, inputVec, outputVec,
+                                        multiThreadLevel};
+    }
+    catch (const std::bad_alloc& e)
+    {
+        std::cerr << BAD_ALLOCATION_ERROR << std::endl;
+        std::exit(1);
+    }
     for (int i = 0; i < multiThreadLevel; ++i)
     {
         jobHandle->contexts[i].threadID = i;
         jobHandle->contexts[i].atomicInputIndex = &jobHandle->atomicInputIndex;
         jobHandle->contexts[i].jobContext = jobHandle;
     }
-    try {
+    std::size_t created = 0;
+    try
+    {
         setStageAndTotal(jobHandle, MAP_STAGE,
                          jobHandle->inputVec.size());
-        for (int i = 0; i < multiThreadLevel; ++i) {
-            jobHandle->threads.emplace_back(mapWorker, i,
-                                            &jobHandle->contexts[i],jobHandle);
+        for (; created < multiThreadLevel; ++created) {
+            jobHandle->threads.emplace_back(mapWorker, created,
+                                            &jobHandle->contexts[created],jobHandle);
+
         }
-    } catch (const std::system_error& e) {
-        std::cerr <<  "system error: failed to create thread" << std::endl;
+    }
+    catch (const std::system_error& e)
+    {
+        for (std::size_t i = 0; i < created; ++i) {
+            jobHandle->threads[i].join();
+        }
+        std::cerr << THREAD_CREATION_ERROR << std::endl;
         delete jobHandle;
-        exit(1);
+        std::exit(1);
     }
     return jobHandle;
 }
-void emit2(K2* key, V2* value, void* context) {
+void emit2(K2* key, V2* value, void* context)
+{
     auto* threadContext = static_cast<ThreadContext*>(context);
     threadContext->intermediateVec.emplace_back(key, value);
     threadContext->jobContext->shuffleCounter.fetch_add(1);
@@ -203,7 +238,8 @@ void emit3(K3* key, V3* value, void* context)
     std::lock_guard<std::mutex> lock(threadContext->jobContext->outputMutex);
     threadContext->jobContext->outputVec.emplace_back(key,value);
 }
-void waitForJob(JobHandle job) {
+void waitForJob(JobHandle job)
+{
     auto jobHandle = static_cast<JobContext*>(job);
     std::lock_guard<std::mutex> lock(jobHandle->joinThreadsMutex);
     if (!jobHandle->threadsJoined) {
@@ -216,11 +252,13 @@ void waitForJob(JobHandle job) {
     }
 
 }
-void closeJobHandle(JobHandle job) {
+void closeJobHandle(JobHandle job)
+{
     waitForJob(job);
     delete static_cast<JobContext*>(job);
 }
-void getJobState(JobHandle job, JobState* state) {
+void getJobState(JobHandle job, JobState* state)
+{
     auto jobHandle = static_cast<JobContext*>(job);
     getJobState(jobHandle->atomicInputIndex, state);
 }
