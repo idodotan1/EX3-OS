@@ -204,7 +204,7 @@ JobHandle startMapReduceJob(const MapReduceClient& client,
         jobHandle->contexts[i].atomicInputIndex = &jobHandle->atomicInputIndex;
         jobHandle->contexts[i].jobContext = jobHandle;
     }
-    std::size_t created = 0;
+    int created = 0;
     try
     {
         setStageAndTotal(jobHandle, MAP_STAGE,
@@ -217,7 +217,7 @@ JobHandle startMapReduceJob(const MapReduceClient& client,
     }
     catch (const std::system_error& e)
     {
-        for (std::size_t i = 0; i < created; ++i) {
+        for (int i = 0; i < created; ++i) {
             jobHandle->threads[i].join();
         }
         std::cerr << THREAD_CREATION_ERROR << std::endl;
